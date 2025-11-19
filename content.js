@@ -12,7 +12,7 @@ let isChatGPT = false;
 // 监听来自 popup.js 的消息，实现按下按钮后导出或复制聊天记录
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === "exportChatAsMarkdown") {
-        exportChatAsMarkdown();
+        exportChatAsZip();
     }
     if (request.action === "copyChatAsMarkdown") {
         copyChatAsMarkdown();
@@ -265,32 +265,96 @@ function createExportButton() {
     };
     document.body.appendChild(exportButton);
     Object.assign(exportButton.style, styles);
-    exportButton.addEventListener('click', exportChatAsMarkdown);
+    exportButton.addEventListener('click', exportChatAsZip);
 }
 
-// 导出聊天记录为 Markdown 格式
-function exportChatAsMarkdown() {
+// 导出聊天记录为带图片的 ZIP 格式
+async function exportChatAsZip() {
+    console.log('开始导出聊天记录（含图片）...');
+
     let markdownContent = "";
+    let allImages = []; // 收集所有图片
     let allElements = getConversationElements();
 
+    console.log(`[导出] 找到 ${allElements.length} 个对话元素`);
+
+    // 遍历对话元素，收集markdown内容和图片
     for (let i = 0; i < allElements.length; i += 2) {
         if (!allElements[i + 1]) break; // 防止越界
-        let userText = allElements[i].textContent.trim();
+        let userHtml = allElements[i].innerHTML.trim();
         let answerHtml = allElements[i + 1].innerHTML.trim();
 
-        userText = htmlToMarkdown(userText);
-        answerHtml = htmlToMarkdown(answerHtml);
+        console.log(`[导出] 处理对话 ${i/2 + 1}:`);
+        console.log(`  用户HTML (前200字符): ${userHtml.substring(0, 200)}`);
+        console.log(`  回答HTML (前200字符): ${answerHtml.substring(0, 200)}`);
+        console.log(`  用户HTML包含<img>: ${userHtml.includes('<img')}`);
+        console.log(`  回答HTML包含<img>: ${answerHtml.includes('<img')}`);
 
-        // const isGrok = window.location.href.includes("grok.com");
-        // markdownContent += `\n# 用户问题\n${userText}\n# ${isGrok ? 'Grok' : 'ChatGPT'}\n${answerHtml}`;
-        markdownContent += `\n# 用户问题\n${userText}\n# 回答\n${answerHtml}`;
+        // 用户问题也可能包含图片（粘贴的图片），使用图片收集模式
+        const userResult = htmlToMarkdown(userHtml, true);
+        let userMarkdown;
+
+        if (typeof userResult === 'object') {
+            userMarkdown = userResult.markdown;
+            allImages = allImages.concat(userResult.images);
+        } else {
+            userMarkdown = userResult;
+        }
+
+        // 回答可能包含图片，使用图片收集模式
+        const answerResult = htmlToMarkdown(answerHtml, true);
+        let answerMarkdown;
+
+        if (typeof answerResult === 'object') {
+            // 返回的是对象，包含markdown和images
+            answerMarkdown = answerResult.markdown;
+            allImages = allImages.concat(answerResult.images);
+        } else {
+            // 返回的是字符串（兼容性处理）
+            answerMarkdown = answerResult;
+        }
+
+        markdownContent += `\n# 用户问题\n${userMarkdown}\n# 回答\n${answerMarkdown}`;
     }
+
+    // 统一重新编号所有图片，确保序号连续且不重复
+    allImages.forEach((img, index) => {
+        const extension = img.filename.split('.').pop();
+        const newFilename = `image_${String(index + 1).padStart(3, '0')}.${extension}`;
+        const newLocalPath = `./images/${newFilename}`;
+
+        // 替换markdown中的旧路径为新路径
+        markdownContent = markdownContent.replace(img.localPath, newLocalPath);
+
+        // 更新图片对象
+        img.filename = newFilename;
+        img.localPath = newLocalPath;
+    });
     markdownContent = markdownContent.replace(/&amp;/g, '&');
 
-    if (markdownContent) {
-        download(markdownContent, 'chat-export.md', 'text/markdown');
-    } else {
+    if (!markdownContent) {
         console.log("未找到对话内容");
+        alert("未找到对话内容");
+        return;
+    }
+
+    console.log(`找到 ${allImages.length} 张图片`);
+
+    try {
+        // 下载所有图片
+        const downloadedImages = await downloadImages(allImages);
+
+        // 创建ZIP文件
+        const zipBlob = await createZipFile(markdownContent, downloadedImages);
+
+        // 下载ZIP文件
+        download(zipBlob, 'chat-export.zip', 'application/zip');
+
+        console.log('✓ 导出完成！');
+        alert(`导出成功！包含 ${downloadedImages.length} 张图片`);
+    } catch (error) {
+        console.error('导出失败:', error);
+        alert('导出失败，请查看控制台了解详情');
     }
 }
 
@@ -314,9 +378,12 @@ function download(data, filename, type) {
 }
 
 // 将 HTML 转换为 Markdown
-function htmlToMarkdown(html) {
+function htmlToMarkdown(html, collectImages = false) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, 'text/html');
+
+    // 图片收集数组（仅在导出时使用）
+    const imageList = [];
 
     // 1. 处理公式
     // FIXME: Gemini 公式处理时渲染使用html前端渲染控制角标等，所以行内公式只能按照文本格式显示
@@ -362,9 +429,44 @@ function htmlToMarkdown(html) {
     });
 
     // 6. 处理图片
-    doc.querySelectorAll('img').forEach(img => {
-        const markdownImage = `![${img.alt}](${img.src})`;
-        img.parentNode.replaceChild(document.createTextNode(markdownImage), img);
+    const imgElements = doc.querySelectorAll('img');
+    if (collectImages) {
+        console.log(`[图片收集] 在HTML片段中找到 ${imgElements.length} 个img标签`);
+    }
+
+    imgElements.forEach((img, index) => {
+        if (collectImages) {
+            // 收集图片信息用于下载
+            const imageUrl = img.src;
+            const imageAlt = img.alt || `image_${String(index + 1).padStart(3, '0')}`;
+
+            console.log(`[图片收集] 图片 ${index + 1}: ${imageUrl.substring(0, 100)}...`);
+
+            // 从URL中提取文件扩展名，默认为png
+            let extension = 'png';
+            const urlMatch = imageUrl.match(/\.([a-zA-Z0-9]+)(?:\?|$)/);
+            if (urlMatch) {
+                extension = urlMatch[1].toLowerCase();
+            }
+
+            const imageName = `image_${String(index + 1).padStart(3, '0')}.${extension}`;
+            const localPath = `./images/${imageName}`;
+
+            imageList.push({
+                url: imageUrl,
+                alt: imageAlt,
+                filename: imageName,
+                localPath: localPath
+            });
+
+            // 使用本地路径替换
+            const markdownImage = `![${imageAlt}](${localPath})`;
+            img.parentNode.replaceChild(document.createTextNode(markdownImage), img);
+        } else {
+            // 原有逻辑：直接使用URL
+            const markdownImage = `![${img.alt}](${img.src})`;
+            img.parentNode.replaceChild(document.createTextNode(markdownImage), img);
+        }
     });
 
     // 7. 代码块处理
@@ -457,7 +559,15 @@ function htmlToMarkdown(html) {
 
     let markdown = doc.body.textContent || '';
 
-    return markdown.trim();
+    // 根据collectImages参数返回不同格式
+    if (collectImages) {
+        return {
+            markdown: markdown.trim(),
+            images: imageList
+        };
+    } else {
+        return markdown.trim();
+    }
 
     // let markdown = doc.body.innerHTML.replace(/<[^>]*>/g, '');
     // markdown = markdown.replaceAll(/- &gt;/g, '- $\\gt$');
@@ -468,4 +578,76 @@ function htmlToMarkdown(html) {
     // markdown = markdown.replaceAll(/≠/g, '\\neq');
 
     // return markdown.trim();
+}
+
+// 异步下载图片列表
+async function downloadImages(imageList) {
+    const downloadedImages = [];
+
+    for (let i = 0; i < imageList.length; i++) {
+        const imageInfo = imageList[i];
+        try {
+            console.log(`下载图片 ${i + 1}/${imageList.length}: ${imageInfo.url}`);
+
+            // 使用fetch下载图片
+            const response = await fetch(imageInfo.url);
+            if (!response.ok) {
+                console.error(`下载失败 (${response.status}): ${imageInfo.url}`);
+                continue;
+            }
+
+            // 转换为Blob
+            const blob = await response.blob();
+
+            downloadedImages.push({
+                filename: imageInfo.filename,
+                blob: blob,
+                localPath: imageInfo.localPath
+            });
+
+            console.log(`✓ 下载成功: ${imageInfo.filename}`);
+        } catch (error) {
+            console.error(`下载图片失败: ${imageInfo.url}`, error);
+            // 继续下载其他图片，不中断整个流程
+        }
+    }
+
+    console.log(`图片下载完成: ${downloadedImages.length}/${imageList.length}`);
+    return downloadedImages;
+}
+
+// 创建包含markdown和图片的ZIP文件
+async function createZipFile(markdownContent, downloadedImages) {
+    console.log('创建ZIP文件...');
+
+    // 创建JSZip实例
+    const zip = new JSZip();
+
+    // 添加markdown文件
+    zip.file('chat-export.md', markdownContent);
+    console.log('✓ 添加markdown文件');
+
+    // 如果有图片，创建images文件夹并添加图片
+    if (downloadedImages.length > 0) {
+        const imagesFolder = zip.folder('images');
+
+        for (const image of downloadedImages) {
+            imagesFolder.file(image.filename, image.blob);
+            console.log(`✓ 添加图片: ${image.filename}`);
+        }
+
+        console.log(`✓ 共添加 ${downloadedImages.length} 张图片`);
+    }
+
+    // 生成ZIP文件的Blob
+    const zipBlob = await zip.generateAsync({
+        type: 'blob',
+        compression: 'DEFLATE',
+        compressionOptions: {
+            level: 6
+        }
+    });
+
+    console.log('✓ ZIP文件创建完成');
+    return zipBlob;
 }
