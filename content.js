@@ -318,15 +318,29 @@ async function exportChatAsZip() {
     }
 
     // 统一重新编号所有图片，确保序号连续且不重复
-    allImages.forEach((img, index) => {
-        const extension = img.filename.split('.').pop();
+    // 需要按照图片在markdown中出现的顺序来编号，而不是按照收集的顺序
+
+    // 创建一个临时映射，记录每个临时路径在markdown中第一次出现的位置
+    const imagePositions = allImages.map(img => ({
+        image: img,
+        firstPosition: markdownContent.indexOf(img.localPath)
+    }));
+
+    // 按照在markdown中出现的位置排序
+    imagePositions.sort((a, b) => a.firstPosition - b.firstPosition);
+
+    // 按照排序后的顺序重新编号
+    imagePositions.forEach((item, index) => {
+        const img = item.image;
+        const extension = img.extension || img.filename.split('.').pop();
         const newFilename = `image_${String(index + 1).padStart(3, '0')}.${extension}`;
         const newLocalPath = `./images/${newFilename}`;
 
-        // 替换markdown中的旧路径为新路径
+        // 替换markdown中的旧临时路径为新的正式路径
+        // 因为临时路径是唯一的，所以不会有替换错误的问题
         markdownContent = markdownContent.replace(img.localPath, newLocalPath);
 
-        // 更新图片对象
+        // 更新图片对象为最终的文件名
         img.filename = newFilename;
         img.localPath = newLocalPath;
     });
@@ -449,18 +463,21 @@ function htmlToMarkdown(html, collectImages = false) {
                 extension = urlMatch[1].toLowerCase();
             }
 
-            const imageName = `image_${String(index + 1).padStart(3, '0')}.${extension}`;
-            const localPath = `./images/${imageName}`;
+            // 使用唯一的临时标识符，避免重复路径导致替换错误
+            const uniqueId = `temp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+            const tempImageName = `${uniqueId}.${extension}`;
+            const tempLocalPath = `./images/${tempImageName}`;
 
             imageList.push({
                 url: imageUrl,
                 alt: imageAlt,
-                filename: imageName,
-                localPath: localPath
+                filename: tempImageName, // 临时文件名，后续会统一重新编号
+                localPath: tempLocalPath,
+                extension: extension // 保存扩展名用于后续重命名
             });
 
-            // 使用本地路径替换
-            const markdownImage = `![${imageAlt}](${localPath})`;
+            // 使用临时路径替换（确保唯一性）
+            const markdownImage = `![${imageAlt}](${tempLocalPath})`;
             img.parentNode.replaceChild(document.createTextNode(markdownImage), img);
         } else {
             // 原有逻辑：直接使用URL
