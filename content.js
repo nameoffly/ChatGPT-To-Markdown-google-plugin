@@ -8,6 +8,13 @@
 let shouldShowExportButton = true;
 let isGrok = false;
 let isGemini = false;
+
+// Global storage for multi-conversation export data (stored in memory, not serialized)
+// This avoids the issue of Blob objects being lost during message passing or chrome.storage
+let multiExportData = {
+    exportedConversations: [],
+    errors: []
+};
 let isChatGPT = false;
 // 监听来自 popup.js 的消息，实现按下按钮后导出或复制聊天记录
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -36,15 +43,117 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // NEW: Export current conversation (for multi-export)
     if (request.action === "exportCurrentConversation") {
         exportCurrentConversationData(request.conversationInfo)
-            .then(result => sendResponse(result))
-            .catch(error => sendResponse({ success: false, error: error.message }));
+            .then(async result => {
+                if (result.success) {
+                    // Convert Blobs to ArrayBuffers for storage
+                    const images = result.data.images || [];
+                    const serializedImages = [];
+
+                    for (const img of images) {
+                        if (img.blob) {
+                            const arrayBuffer = await img.blob.arrayBuffer();
+                            serializedImages.push({
+                                filename: img.filename,
+                                arrayBuffer: Array.from(new Uint8Array(arrayBuffer)),
+                                type: img.blob.type,
+                                localPath: img.localPath
+                            });
+                        }
+                    }
+
+                    const exportItem = {
+                        conversation: request.conversationInfo,
+                        data: {
+                            markdown: result.data.markdown,
+                            images: serializedImages
+                        }
+                    };
+
+                    // Load existing data from storage
+                    const storage = await chrome.storage.local.get('multiExportData');
+                    const existingData = storage.multiExportData || { exportedConversations: [], errors: [] };
+
+                    existingData.exportedConversations.push(exportItem);
+
+                    // Save to chrome.storage
+                    await chrome.storage.local.set({ multiExportData: existingData });
+
+                    console.log(`Saved conversation ${request.conversationInfo.title} to storage. Total: ${existingData.exportedConversations.length}`);
+                    sendResponse({ success: true });
+                } else {
+                    // Load existing data
+                    const storage = await chrome.storage.local.get('multiExportData');
+                    const existingData = storage.multiExportData || { exportedConversations: [], errors: [] };
+
+                    existingData.errors.push({
+                        conversation: request.conversationInfo,
+                        error: result.error
+                    });
+
+                    await chrome.storage.local.set({ multiExportData: existingData });
+                    sendResponse({ success: false, error: result.error });
+                }
+            })
+            .catch(async error => {
+                const storage = await chrome.storage.local.get('multiExportData');
+                const existingData = storage.multiExportData || { exportedConversations: [], errors: [] };
+
+                existingData.errors.push({
+                    conversation: request.conversationInfo,
+                    error: error.message
+                });
+
+                await chrome.storage.local.set({ multiExportData: existingData });
+                sendResponse({ success: false, error: error.message });
+            });
         return true; // Async response
     }
 
     // NEW: Create multi-conversation ZIP
     if (request.action === "createMultiConversationZip") {
-        createMultiConversationZip(request.exportedData, request.errors);
-        sendResponse({ success: true });
+        // Read from chrome.storage and convert ArrayBuffers back to Blobs
+        chrome.storage.local.get('multiExportData', async (storage) => {
+            const data = storage.multiExportData || { exportedConversations: [], errors: [] };
+
+            console.log(`Creating ZIP with ${data.exportedConversations.length} conversations from storage`);
+
+            // Convert ArrayBuffers back to Blobs
+            const exportedData = data.exportedConversations.map(item => {
+                const images = item.data.images.map(img => {
+                    const uint8Array = new Uint8Array(img.arrayBuffer);
+                    const blob = new Blob([uint8Array], { type: img.type });
+                    return {
+                        filename: img.filename,
+                        blob: blob,
+                        localPath: img.localPath
+                    };
+                });
+
+                return {
+                    conversation: item.conversation,
+                    data: {
+                        markdown: item.data.markdown,
+                        images: images
+                    }
+                };
+            });
+
+            await createMultiConversationZip(exportedData, data.errors);
+
+            // Clear storage after creating ZIP
+            await chrome.storage.local.remove('multiExportData');
+            sendResponse({ success: true });
+        });
+        return true; // Async response
+    }
+
+    // NEW: Reset multi-export data (when starting new export)
+    if (request.action === "resetMultiExportData") {
+        chrome.storage.local.remove('multiExportData', () => {
+            console.log('Cleared multi-export data from storage');
+            sendResponse({ success: true });
+        });
+        return true; // Async response
     }
 
     return true; // 保持消息通道开放，以便异步响应
@@ -637,6 +746,13 @@ async function downloadImages(imageList) {
             // 转换为Blob
             const blob = await response.blob();
 
+            console.log(`Blob info for ${imageInfo.filename}:`, {
+                type: blob.type,
+                size: blob.size,
+                constructor: blob.constructor.name,
+                isBlob: blob instanceof Blob
+            });
+
             downloadedImages.push({
                 filename: imageInfo.filename,
                 blob: blob,
@@ -710,9 +826,13 @@ function getConversationList() {
     const currentUrl = window.location.href;
     const conversations = [];
 
+    console.log('Getting conversation list from:', currentUrl);
+
     if (currentUrl.includes("openai.com") || currentUrl.includes("chatgpt.com")) {
         // Strategy 1: Find all links that match conversation URL pattern
+        console.log('Strategy 1: Searching for a[href*="/c/"]...');
         const links = document.querySelectorAll('a[href*="/c/"]');
+        console.log(`Found ${links.length} links with /c/ pattern`);
 
         links.forEach(link => {
             const href = link.href;
@@ -721,9 +841,31 @@ function getConversationList() {
             if (match) {
                 const id = match[1];
                 // Get title from link text or aria-label
-                const title = link.textContent.trim() ||
-                              link.getAttribute('aria-label') ||
-                              `Conversation ${id.substring(0, 8)}`;
+                let title = link.textContent.trim();
+
+                // Try multiple methods to get title
+                if (!title || title.length < 2) {
+                    title = link.getAttribute('aria-label') || '';
+                }
+                if (!title || title.length < 2) {
+                    title = link.getAttribute('title') || '';
+                }
+                if (!title || title.length < 2) {
+                    // Try to get text from child elements
+                    const divs = link.querySelectorAll('div');
+                    for (const div of divs) {
+                        const text = div.textContent.trim();
+                        if (text && text.length > 2) {
+                            title = text;
+                            break;
+                        }
+                    }
+                }
+                if (!title || title.length < 2) {
+                    title = `Conversation ${id.substring(0, 8)}`;
+                }
+
+                console.log(`Found conversation: ${title} (${id})`);
 
                 conversations.push({
                     id: id,
@@ -786,7 +928,22 @@ function getConversationList() {
         new Map(conversations.map(c => [c.id, c])).values()
     );
 
-    console.log(`Found ${uniqueConversations.length} conversations`);
+    console.log(`Found ${uniqueConversations.length} unique conversations`);
+
+    if (uniqueConversations.length === 0) {
+        console.error('No conversations found!');
+        console.error('Current URL:', window.location.href);
+        console.error('Total links on page:', document.querySelectorAll('a').length);
+        console.error('Links with /c/:', document.querySelectorAll('a[href*="/c/"]').length);
+
+        // Debug: log all links
+        const allLinks = document.querySelectorAll('a');
+        console.log('Sample links (first 10):');
+        for (let i = 0; i < Math.min(10, allLinks.length); i++) {
+            console.log(`  ${i + 1}. ${allLinks[i].href} - "${allLinks[i].textContent.trim().substring(0, 50)}"`);
+        }
+    }
+
     return uniqueConversations;
 }
 
@@ -883,7 +1040,17 @@ async function exportCurrentConversationData(conversationInfo) {
         const downloadedImages = await downloadImages(allImages);
         console.log(`Downloaded ${downloadedImages.length} images successfully`);
 
-        return {
+        // Verify image data structure
+        if (downloadedImages.length > 0) {
+            console.log('Sample image data:', {
+                filename: downloadedImages[0].filename,
+                blobType: downloadedImages[0].blob?.constructor?.name,
+                blobSize: downloadedImages[0].blob?.size,
+                hasLocalPath: !!downloadedImages[0].localPath
+            });
+        }
+
+        const result = {
             success: true,
             data: {
                 markdown: markdownContent,
@@ -891,6 +1058,9 @@ async function exportCurrentConversationData(conversationInfo) {
                 conversationInfo: conversationInfo
             }
         };
+
+        console.log(`Returning result with ${downloadedImages.length} images`);
+        return result;
 
     } catch (error) {
         console.error('Export failed:', error);
@@ -911,6 +1081,7 @@ async function createMultiConversationZip(exportedData, errors) {
 
     try {
         const zip = new JSZip();
+        console.log('JSZip instance created');
 
         // Add README
         let readmeContent = `# Multi-Conversation Export\n\n`;
@@ -930,25 +1101,71 @@ async function createMultiConversationZip(exportedData, errors) {
         });
 
         zip.file('README.txt', readmeContent);
+        console.log('README.txt added');
 
         // Add each conversation
         for (let i = 0; i < exportedData.length; i++) {
-            const item = exportedData[i];
-            const folderName = `conversation_${String(i + 1).padStart(3, '0')}_${item.conversation.title}`;
-            const conversationFolder = zip.folder(folderName);
+            try {
+                const item = exportedData[i];
+                console.log(`Adding conversation ${i + 1}: ${item.conversation.title}`);
 
-            // Add markdown file
-            conversationFolder.file('conversation.md', item.data.markdown);
-
-            // Add images if any
-            if (item.data.images.length > 0) {
-                const imagesFolder = conversationFolder.folder('images');
-
-                for (const image of item.data.images) {
-                    imagesFolder.file(image.filename, image.blob);
+                // Validate data structure
+                if (!item.data || !item.data.markdown) {
+                    console.error(`Invalid data structure for conversation ${i + 1}:`, item);
+                    continue;
                 }
+
+                const folderName = `conversation_${String(i + 1).padStart(3, '0')}_${item.conversation.title}`;
+                const conversationFolder = zip.folder(folderName);
+                console.log(`Created folder: ${folderName}`);
+
+                // Add markdown file
+                conversationFolder.file('conversation.md', item.data.markdown);
+                console.log(`Added markdown file for conversation ${i + 1}`);
+
+                // Add images if any
+                if (item.data.images && item.data.images.length > 0) {
+                    const imagesFolder = conversationFolder.folder('images');
+                    console.log(`Adding ${item.data.images.length} images for conversation ${i + 1}`);
+
+                    for (let j = 0; j < item.data.images.length; j++) {
+                        const image = item.data.images[j];
+                        console.log(`Processing image ${j + 1}:`, {
+                            filename: image?.filename,
+                            blobType: image?.blob?.constructor?.name,
+                            blobSize: image?.blob?.size,
+                            hasLocalPath: !!image?.localPath
+                        });
+
+                        if (image && image.blob && image.filename) {
+                            // Verify blob is actually a Blob object
+                            if (!(image.blob instanceof Blob)) {
+                                console.error(`Image blob is not a Blob instance for ${image.filename}:`, typeof image.blob);
+                                continue;
+                            }
+
+                            try {
+                                imagesFolder.file(image.filename, image.blob);
+                                console.log(`✓ Added image: ${image.filename}`);
+                            } catch (imgError) {
+                                console.error(`Failed to add image ${image.filename}:`, imgError);
+                            }
+                        } else {
+                            console.warn(`Invalid image data at index ${j}:`, {
+                                hasImage: !!image,
+                                hasBlob: !!image?.blob,
+                                hasFilename: !!image?.filename
+                            });
+                        }
+                    }
+                }
+            } catch (itemError) {
+                console.error(`Error adding conversation ${i + 1}:`, itemError);
+                // Continue with next conversation
             }
         }
+
+        console.log('Starting ZIP generation...');
 
         // Generate ZIP
         const zipBlob = await zip.generateAsync({
@@ -957,15 +1174,22 @@ async function createMultiConversationZip(exportedData, errors) {
             compressionOptions: { level: 6 }
         });
 
+        console.log(`ZIP blob generated, size: ${zipBlob.size} bytes`);
+
         // Download
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
-        download(zipBlob, `multi-chat-export_${timestamp}.zip`, 'application/zip');
+        const filename = `multi-chat-export_${timestamp}.zip`;
+
+        console.log(`Downloading ZIP as: ${filename}`);
+        download(zipBlob, filename, 'application/zip');
 
         console.log('Multi-conversation export complete!');
         alert(`Successfully exported ${exportedData.length} conversations!${errors.length > 0 ? ` (${errors.length} errors)` : ''}`);
 
     } catch (error) {
         console.error('Failed to create multi-conversation ZIP:', error);
-        alert('Failed to create ZIP file. See console for details.');
+        console.error('Error stack:', error.stack);
+        console.error('Exported data:', exportedData);
+        alert(`Failed to create ZIP file.\nError: ${error.message}\nCheck console for details.`);
     }
 }

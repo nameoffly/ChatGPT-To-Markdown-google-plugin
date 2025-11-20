@@ -9,8 +9,8 @@ let exportState = {
     isExporting: false,
     conversations: [],
     currentIndex: 0,
-    exportedData: [],
-    errors: []
+    successCount: 0,
+    errorCount: 0
 };
 
 /**
@@ -27,14 +27,25 @@ async function startMultiConversationExport(conversations) {
         isExporting: true,
         conversations: conversations,
         currentIndex: 0,
-        exportedData: [],
-        errors: []
+        successCount: 0,
+        errorCount: 0
     };
 
     // Store state in chrome.storage for recovery
     await chrome.storage.local.set({ exportState });
 
     console.log(`Starting multi-conversation export: ${conversations.length} conversations`);
+
+    // Reset content script's in-memory data before starting
+    try {
+        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        await chrome.tabs.sendMessage(tabs[0].id, {
+            action: "resetMultiExportData"
+        });
+        console.log("Reset content script export data");
+    } catch (error) {
+        console.warn("Could not reset content script data:", error);
+    }
 
     // Start processing
     processNextConversation();
@@ -70,32 +81,24 @@ async function processNextConversation() {
         await waitForTabLoad(tabId);
 
         // Send message to content script to export
+        // Note: Data is stored in content script's memory, not returned here
         const response = await chrome.tabs.sendMessage(tabId, {
             action: "exportCurrentConversation",
             conversationInfo: conversation
         });
 
         if (response && response.success) {
-            exportState.exportedData.push({
-                conversation: conversation,
-                data: response.data
-            });
+            exportState.successCount++;
             console.log(`Successfully exported: ${conversation.title}`);
         } else {
+            exportState.errorCount++;
             const errorMsg = response ? response.error : "No response from content script";
-            exportState.errors.push({
-                conversation: conversation,
-                error: errorMsg
-            });
             console.error(`Failed to export ${conversation.title}: ${errorMsg}`);
         }
 
     } catch (error) {
         console.error(`Error processing conversation ${conversation.title}:`, error);
-        exportState.errors.push({
-            conversation: conversation,
-            error: error.message
-        });
+        exportState.errorCount++;
     }
 
     // Move to next conversation
@@ -140,17 +143,16 @@ function waitForTabLoad(tabId) {
  * Finish multi-export and create combined ZIP
  */
 async function finishMultiExport() {
-    console.log(`Export complete. Successfully exported: ${exportState.exportedData.length}, Errors: ${exportState.errors.length}`);
+    console.log(`Export complete. Successfully exported: ${exportState.successCount}, Errors: ${exportState.errorCount}`);
 
     // Get the active tab
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     const tabId = tabs[0].id;
 
-    // Send message to content script to create final ZIP
+    // Note: Data is stored in content script's memory, not passed through messages
+    // This avoids Blob serialization issues
     await chrome.tabs.sendMessage(tabId, {
-        action: "createMultiConversationZip",
-        exportedData: exportState.exportedData,
-        errors: exportState.errors
+        action: "createMultiConversationZip"
     });
 
     // Reset state
@@ -167,7 +169,7 @@ async function getExportProgress() {
         isExporting: exportState.isExporting,
         total: exportState.conversations.length,
         current: exportState.currentIndex,
-        errors: exportState.errors.length
+        errors: exportState.errorCount || 0
     };
 }
 
