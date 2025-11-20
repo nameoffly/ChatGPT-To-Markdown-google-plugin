@@ -8,7 +8,83 @@
 let shouldShowExportButton = true;
 let isGrok = false;
 let isGemini = false;
+
+// Global storage for multi-conversation export data (stored in memory, not serialized)
+// This avoids the issue of Blob objects being lost during message passing or chrome.storage
+let multiExportData = {
+    exportedConversations: [],
+    errors: []
+};
 let isChatGPT = false;
+
+// IndexedDB helper functions for storing large data (avoids chrome.storage quota limits)
+const DB_NAME = 'ChatExportDB';
+const DB_VERSION = 1;
+const STORE_NAME = 'conversations';
+
+function openDB() {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => resolve(request.result);
+
+        request.onupgradeneeded = (event) => {
+            const db = event.target.result;
+            if (!db.objectStoreNames.contains(STORE_NAME)) {
+                db.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
+            }
+        };
+    });
+}
+
+async function saveConversationToDB(conversationData) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction([STORE_NAME], 'readwrite');
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.add(conversationData);
+
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function saveErrorToDB(errorData) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction([STORE_NAME], 'readwrite');
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.add({ type: 'error', ...errorData });
+
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function getAllFromDB() {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction([STORE_NAME], 'readonly');
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.getAll();
+
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function clearDB() {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction([STORE_NAME], 'readwrite');
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.clear();
+
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+    });
+}
 // 监听来自 popup.js 的消息，实现按下按钮后导出或复制聊天记录
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === "exportChatAsMarkdown") {
@@ -26,6 +102,136 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === "getButtonStatus") {
         sendResponse({show: shouldShowExportButton});
     }
+
+    // NEW: Get conversation list
+    if (request.action === "getConversationList") {
+        const conversations = getConversationList();
+        sendResponse({ success: true, conversations: conversations });
+    }
+
+    // NEW: Export current conversation (for multi-export)
+    if (request.action === "exportCurrentConversation") {
+        exportCurrentConversationData(request.conversationInfo)
+            .then(async result => {
+                try {
+                    if (result.success) {
+                        console.log(`[Export] Processing result for: ${request.conversationInfo.title}`);
+
+                        // Store Blobs directly in IndexedDB (no need to convert to ArrayBuffer)
+                        // IndexedDB supports Blob objects natively
+                        const exportItem = {
+                            type: 'conversation',
+                            conversation: request.conversationInfo,
+                            data: {
+                                markdown: result.data.markdown,
+                                images: result.data.images  // Store Blobs directly
+                            }
+                        };
+
+                        // Save to IndexedDB instead of chrome.storage
+                        await saveConversationToDB(exportItem);
+
+                        console.log(`[Export] ✓ Saved conversation "${request.conversationInfo.title}" to IndexedDB`);
+                        sendResponse({ success: true });
+                    } else {
+                        console.error(`[Export] ✗ Export failed for "${request.conversationInfo.title}": ${result.error}`);
+
+                        // Save error to IndexedDB
+                        await saveErrorToDB({
+                            conversation: request.conversationInfo,
+                            error: result.error
+                        });
+
+                        sendResponse({ success: false, error: result.error });
+                    }
+                } catch (processingError) {
+                    console.error(`[Export] ✗ Error processing export for "${request.conversationInfo.title}":`, processingError);
+
+                    // Save error to IndexedDB
+                    try {
+                        await saveErrorToDB({
+                            conversation: request.conversationInfo,
+                            error: processingError.message
+                        });
+                    } catch (dbError) {
+                        console.error('[Export] Failed to save error to DB:', dbError);
+                    }
+
+                    sendResponse({ success: false, error: processingError.message });
+                }
+            })
+            .catch(async error => {
+                console.error(`[Export] ✗ Catch block - Error exporting "${request.conversationInfo.title}":`, error);
+
+                // Save error to IndexedDB
+                try {
+                    await saveErrorToDB({
+                        conversation: request.conversationInfo,
+                        error: error.message || String(error)
+                    });
+                } catch (dbError) {
+                    console.error('[Export] Failed to save error to DB:', dbError);
+                }
+
+                sendResponse({ success: false, error: error.message || String(error) });
+            });
+        return true; // Async response
+    }
+
+    // NEW: Create multi-conversation ZIP
+    if (request.action === "createMultiConversationZip") {
+        // Read from IndexedDB
+        getAllFromDB()
+            .then(async allData => {
+                console.log(`[ZIP] Retrieved ${allData.length} items from IndexedDB`);
+
+                // Separate conversations and errors
+                const exportedData = allData
+                    .filter(item => item.type === 'conversation')
+                    .map(item => ({
+                        conversation: item.conversation,
+                        data: item.data  // Blobs are already in the correct format
+                    }));
+
+                const errors = allData
+                    .filter(item => item.type === 'error')
+                    .map(item => ({
+                        conversation: item.conversation,
+                        error: item.error
+                    }));
+
+                console.log(`[ZIP] Creating ZIP with ${exportedData.length} conversations and ${errors.length} errors`);
+
+                await createMultiConversationZip(exportedData, errors);
+
+                // Clear IndexedDB after creating ZIP
+                await clearDB();
+                console.log('[ZIP] Cleared IndexedDB');
+
+                sendResponse({ success: true });
+            })
+            .catch(error => {
+                console.error('[ZIP] Error reading from IndexedDB:', error);
+                alert(`Failed to create ZIP: ${error.message}`);
+                sendResponse({ success: false, error: error.message });
+            });
+        return true; // Async response
+    }
+
+    // NEW: Reset multi-export data (when starting new export)
+    if (request.action === "resetMultiExportData") {
+        clearDB()
+            .then(() => {
+                console.log('[Reset] Cleared IndexedDB');
+                sendResponse({ success: true });
+            })
+            .catch(error => {
+                console.error('[Reset] Error clearing IndexedDB:', error);
+                sendResponse({ success: false, error: error.message });
+            });
+        return true; // Async response
+    }
+
     return true; // 保持消息通道开放，以便异步响应
 });
 
@@ -616,6 +822,13 @@ async function downloadImages(imageList) {
             // 转换为Blob
             const blob = await response.blob();
 
+            console.log(`Blob info for ${imageInfo.filename}:`, {
+                type: blob.type,
+                size: blob.size,
+                constructor: blob.constructor.name,
+                isBlob: blob instanceof Blob
+            });
+
             downloadedImages.push({
                 filename: imageInfo.filename,
                 blob: blob,
@@ -667,4 +880,401 @@ async function createZipFile(markdownContent, downloadedImages) {
 
     console.log('✓ ZIP文件创建完成');
     return zipBlob;
+}
+
+/**
+ * Sanitize filename to remove invalid characters
+ * @param {string} filename - Original filename
+ * @returns {string} Sanitized filename
+ */
+function sanitizeFilename(filename) {
+    return filename
+        .replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
+        .replace(/\s+/g, '_')
+        .substring(0, 100); // Limit length
+}
+
+/**
+ * Get all conversation links from ChatGPT sidebar
+ * @returns {Array} Array of {title, url, id} objects
+ */
+function getConversationList() {
+    const currentUrl = window.location.href;
+    const conversations = [];
+
+    console.log('Getting conversation list from:', currentUrl);
+
+    if (currentUrl.includes("openai.com") || currentUrl.includes("chatgpt.com")) {
+        // Strategy 1: Find all links that match conversation URL pattern
+        console.log('Strategy 1: Searching for a[href*="/c/"]...');
+        const links = document.querySelectorAll('a[href*="/c/"]');
+        console.log(`Found ${links.length} links with /c/ pattern`);
+
+        links.forEach(link => {
+            const href = link.href;
+            const match = href.match(/\/c\/([a-zA-Z0-9-]+)/);
+
+            if (match) {
+                const id = match[1];
+                // Get title from link text or aria-label
+                let title = link.textContent.trim();
+
+                // Try multiple methods to get title
+                if (!title || title.length < 2) {
+                    title = link.getAttribute('aria-label') || '';
+                }
+                if (!title || title.length < 2) {
+                    title = link.getAttribute('title') || '';
+                }
+                if (!title || title.length < 2) {
+                    // Try to get text from child elements
+                    const divs = link.querySelectorAll('div');
+                    for (const div of divs) {
+                        const text = div.textContent.trim();
+                        if (text && text.length > 2) {
+                            title = text;
+                            break;
+                        }
+                    }
+                }
+                if (!title || title.length < 2) {
+                    title = `Conversation ${id.substring(0, 8)}`;
+                }
+
+                console.log(`Found conversation: ${title} (${id})`);
+
+                conversations.push({
+                    id: id,
+                    url: href,
+                    title: sanitizeFilename(title)
+                });
+            }
+        });
+
+        // Strategy 2: Try alternative selectors if no results
+        if (conversations.length === 0) {
+            console.log("Strategy 1 failed, trying alternative selectors...");
+            const navItems = document.querySelectorAll('nav li a, aside li a');
+            navItems.forEach(link => {
+                const href = link.href;
+                const match = href.match(/\/c\/([a-zA-Z0-9-]+)/);
+
+                if (match) {
+                    const id = match[1];
+                    const title = link.textContent.trim() ||
+                                  link.getAttribute('aria-label') ||
+                                  `Conversation ${id.substring(0, 8)}`;
+
+                    conversations.push({
+                        id: id,
+                        url: href,
+                        title: sanitizeFilename(title)
+                    });
+                }
+            });
+        }
+
+        // Strategy 3: Fallback - any links with conversation pattern
+        if (conversations.length === 0) {
+            console.log("Strategy 2 failed, trying fallback...");
+            const allLinks = document.querySelectorAll('a');
+            allLinks.forEach(link => {
+                const href = link.href;
+                if (/\/c\/[a-zA-Z0-9-]+/.test(href)) {
+                    const match = href.match(/\/c\/([a-zA-Z0-9-]+)/);
+                    if (match) {
+                        const id = match[1];
+                        const title = link.textContent.trim() ||
+                                      link.getAttribute('aria-label') ||
+                                      `Conversation ${id.substring(0, 8)}`;
+
+                        conversations.push({
+                            id: id,
+                            url: href,
+                            title: sanitizeFilename(title)
+                        });
+                    }
+                }
+            });
+        }
+    }
+
+    // Remove duplicates based on ID
+    const uniqueConversations = Array.from(
+        new Map(conversations.map(c => [c.id, c])).values()
+    );
+
+    console.log(`Found ${uniqueConversations.length} unique conversations`);
+
+    if (uniqueConversations.length === 0) {
+        console.error('No conversations found!');
+        console.error('Current URL:', window.location.href);
+        console.error('Total links on page:', document.querySelectorAll('a').length);
+        console.error('Links with /c/:', document.querySelectorAll('a[href*="/c/"]').length);
+
+        // Debug: log all links
+        const allLinks = document.querySelectorAll('a');
+        console.log('Sample links (first 10):');
+        for (let i = 0; i < Math.min(10, allLinks.length); i++) {
+            console.log(`  ${i + 1}. ${allLinks[i].href} - "${allLinks[i].textContent.trim().substring(0, 50)}"`);
+        }
+    }
+
+    return uniqueConversations;
+}
+
+/**
+ * Check if current page is a conversation page
+ * @returns {boolean} True if on conversation page
+ */
+function isConversationPage() {
+    const url = window.location.href;
+    return url.match(/\/c\/[a-zA-Z0-9-]+/) !== null;
+}
+
+/**
+ * Get current conversation ID
+ * @returns {string|null} Conversation ID or null
+ */
+function getCurrentConversationId() {
+    const match = window.location.href.match(/\/c\/([a-zA-Z0-9-]+)/);
+    return match ? match[1] : null;
+}
+
+/**
+ * Export current conversation and return data (for multi-export)
+ * Does not download, just returns the data
+ * @param {Object} conversationInfo - Conversation metadata {id, title, url}
+ * @returns {Promise<Object>} Export result with success status and data
+ */
+async function exportCurrentConversationData(conversationInfo) {
+    console.log(`Exporting conversation: ${conversationInfo.title}`);
+
+    try {
+        let markdownContent = "";
+        let allImages = [];
+        let allElements = getConversationElements();
+
+        console.log(`Found ${allElements.length} conversation elements`);
+
+        if (allElements.length === 0) {
+            throw new Error("No conversation elements found");
+        }
+
+        // Process conversation elements (same as exportChatAsZip)
+        for (let i = 0; i < allElements.length; i += 2) {
+            if (!allElements[i + 1]) break;
+
+            let userHtml = allElements[i].innerHTML.trim();
+            let answerHtml = allElements[i + 1].innerHTML.trim();
+
+            const userResult = htmlToMarkdown(userHtml, true);
+            let userMarkdown;
+            if (typeof userResult === 'object') {
+                userMarkdown = userResult.markdown;
+                allImages = allImages.concat(userResult.images);
+            } else {
+                userMarkdown = userResult;
+            }
+
+            const answerResult = htmlToMarkdown(answerHtml, true);
+            let answerMarkdown;
+            if (typeof answerResult === 'object') {
+                answerMarkdown = answerResult.markdown;
+                allImages = allImages.concat(answerResult.images);
+            } else {
+                answerMarkdown = answerResult;
+            }
+
+            markdownContent += `\n# 用户问题\n${userMarkdown}\n# 回答\n${answerMarkdown}`;
+        }
+
+        // Re-number images
+        const imagePositions = allImages.map(img => ({
+            image: img,
+            firstPosition: markdownContent.indexOf(img.localPath)
+        }));
+
+        imagePositions.sort((a, b) => a.firstPosition - b.firstPosition);
+
+        imagePositions.forEach((item, index) => {
+            const img = item.image;
+            const extension = img.extension || img.filename.split('.').pop();
+            const newFilename = `image_${String(index + 1).padStart(3, '0')}.${extension}`;
+            const newLocalPath = `./images/${newFilename}`;
+
+            markdownContent = markdownContent.replace(new RegExp(img.localPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), newLocalPath);
+
+            img.filename = newFilename;
+            img.localPath = newLocalPath;
+        });
+
+        markdownContent = markdownContent.replace(/&amp;/g, '&');
+
+        // Download images
+        console.log(`Downloading ${allImages.length} images...`);
+        const downloadedImages = await downloadImages(allImages);
+        console.log(`Downloaded ${downloadedImages.length} images successfully`);
+
+        // Verify image data structure
+        if (downloadedImages.length > 0) {
+            console.log('Sample image data:', {
+                filename: downloadedImages[0].filename,
+                blobType: downloadedImages[0].blob?.constructor?.name,
+                blobSize: downloadedImages[0].blob?.size,
+                hasLocalPath: !!downloadedImages[0].localPath
+            });
+        }
+
+        const result = {
+            success: true,
+            data: {
+                markdown: markdownContent,
+                images: downloadedImages,
+                conversationInfo: conversationInfo
+            }
+        };
+
+        console.log(`Returning result with ${downloadedImages.length} images`);
+        return result;
+
+    } catch (error) {
+        console.error('Export failed:', error);
+        return {
+            success: false,
+            error: error.message
+        };
+    }
+}
+
+/**
+ * Create multi-conversation ZIP file
+ * @param {Array} exportedData - Array of exported conversation data
+ * @param {Array} errors - Array of error objects
+ */
+async function createMultiConversationZip(exportedData, errors) {
+    console.log(`Creating multi-conversation ZIP with ${exportedData.length} conversations`);
+
+    try {
+        const zip = new JSZip();
+        console.log('JSZip instance created');
+
+        // Add README
+        let readmeContent = `# Multi-Conversation Export\n\n`;
+        readmeContent += `Export Date: ${new Date().toLocaleString()}\n`;
+        readmeContent += `Total Conversations: ${exportedData.length}\n`;
+
+        if (errors.length > 0) {
+            readmeContent += `\n## Errors (${errors.length})\n`;
+            errors.forEach((err, idx) => {
+                readmeContent += `${idx + 1}. ${err.conversation.title}: ${err.error}\n`;
+            });
+        }
+
+        readmeContent += `\n## Conversations\n`;
+        exportedData.forEach((item, idx) => {
+            readmeContent += `${idx + 1}. ${item.conversation.title}\n`;
+        });
+
+        zip.file('README.txt', readmeContent);
+        console.log('README.txt added');
+
+        // Add each conversation
+        for (let i = 0; i < exportedData.length; i++) {
+            try {
+                const item = exportedData[i];
+                console.log(`Adding conversation ${i + 1}: ${item.conversation.title}`);
+
+                // Validate data structure
+                if (!item.data || !item.data.markdown) {
+                    console.error(`Invalid data structure for conversation ${i + 1}:`, item);
+                    continue;
+                }
+
+                const folderName = `conversation_${String(i + 1).padStart(3, '0')}_${item.conversation.title}`;
+                const conversationFolder = zip.folder(folderName);
+                console.log(`Created folder: ${folderName}`);
+
+                // Add markdown file
+                conversationFolder.file('conversation.md', item.data.markdown);
+                console.log(`Added markdown file for conversation ${i + 1}`);
+
+                // Add images if any
+                if (item.data.images && item.data.images.length > 0) {
+                    const imagesFolder = conversationFolder.folder('images');
+                    console.log(`Adding ${item.data.images.length} images for conversation ${i + 1}`);
+
+                    for (let j = 0; j < item.data.images.length; j++) {
+                        const image = item.data.images[j];
+                        console.log(`Processing image ${j + 1}:`, {
+                            filename: image?.filename,
+                            blobType: image?.blob?.constructor?.name,
+                            blobSize: image?.blob?.size,
+                            hasLocalPath: !!image?.localPath
+                        });
+
+                        if (image && image.blob && image.filename) {
+                            // Verify blob is actually a Blob object
+                            if (!(image.blob instanceof Blob)) {
+                                console.error(`Image blob is not a Blob instance for ${image.filename}:`, typeof image.blob);
+                                continue;
+                            }
+
+                            try {
+                                imagesFolder.file(image.filename, image.blob);
+                                console.log(`✓ Added image: ${image.filename}`);
+                            } catch (imgError) {
+                                console.error(`Failed to add image ${image.filename}:`, imgError);
+                            }
+                        } else {
+                            console.warn(`Invalid image data at index ${j}:`, {
+                                hasImage: !!image,
+                                hasBlob: !!image?.blob,
+                                hasFilename: !!image?.filename
+                            });
+                        }
+                    }
+                }
+            } catch (itemError) {
+                console.error(`Error adding conversation ${i + 1}:`, itemError);
+                // Continue with next conversation
+            }
+        }
+
+        console.log('Starting ZIP generation...');
+
+        // Generate ZIP
+        const zipBlob = await zip.generateAsync({
+            type: 'blob',
+            compression: 'DEFLATE',
+            compressionOptions: { level: 6 }
+        });
+
+        console.log(`ZIP blob generated, size: ${zipBlob.size} bytes`);
+
+        // Download
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+        const filename = `multi-chat-export_${timestamp}.zip`;
+
+        console.log(`Downloading ZIP as: ${filename}`);
+        download(zipBlob, filename, 'application/zip');
+
+        console.log('Multi-conversation export complete!');
+
+        let alertMessage = `Successfully exported ${exportedData.length} conversations!`;
+        if (errors.length > 0) {
+            alertMessage += `\n\n⚠️ ${errors.length} errors occurred:\n`;
+            errors.forEach((err, idx) => {
+                alertMessage += `${idx + 1}. ${err.conversation.title}\n   Error: ${err.error}\n`;
+            });
+            alertMessage += `\nCheck the README.txt in the ZIP file for details.`;
+        }
+        alert(alertMessage);
+
+    } catch (error) {
+        console.error('Failed to create multi-conversation ZIP:', error);
+        console.error('Error stack:', error.stack);
+        console.error('Exported data:', exportedData);
+        alert(`Failed to create ZIP file.\nError: ${error.message}\nCheck console for details.`);
+    }
 }
