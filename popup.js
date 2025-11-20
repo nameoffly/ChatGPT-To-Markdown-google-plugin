@@ -16,8 +16,52 @@ document.addEventListener('DOMContentLoaded', function() {
     const progressFill = document.getElementById('progressFill');
     const statusText = document.getElementById('statusText');
 
+    // Settings elements
+    const pageLoadWaitSlider = document.getElementById('pageLoadWait');
+    const conversationDelaySlider = document.getElementById('conversationDelay');
+    const pageLoadDisplay = document.getElementById('pageLoadDisplay');
+    const delayDisplay = document.getElementById('delayDisplay');
+    const saveSettingsBtn = document.getElementById('saveSettings');
+    const saveStatus = document.getElementById('saveStatus');
+
     let conversationData = [];
     let exportInterval = null;
+
+    // Load saved settings
+    chrome.storage.sync.get(['pageLoadWait', 'conversationDelay'], (result) => {
+        if (result.pageLoadWait !== undefined) {
+            pageLoadWaitSlider.value = result.pageLoadWait;
+            pageLoadDisplay.textContent = result.pageLoadWait;
+        }
+        if (result.conversationDelay !== undefined) {
+            conversationDelaySlider.value = result.conversationDelay;
+            delayDisplay.textContent = result.conversationDelay;
+        }
+    });
+
+    // Update display when sliders change
+    pageLoadWaitSlider.addEventListener('input', (e) => {
+        pageLoadDisplay.textContent = e.target.value;
+    });
+
+    conversationDelaySlider.addEventListener('input', (e) => {
+        delayDisplay.textContent = e.target.value;
+    });
+
+    // Save settings
+    saveSettingsBtn.addEventListener('click', () => {
+        const settings = {
+            pageLoadWait: parseFloat(pageLoadWaitSlider.value),
+            conversationDelay: parseFloat(conversationDelaySlider.value)
+        };
+
+        chrome.storage.sync.set(settings, () => {
+            saveStatus.textContent = '✓ Saved!';
+            setTimeout(() => {
+                saveStatus.textContent = '';
+            }, 2000);
+        });
+    });
 
     // 查询当前按钮状态
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {

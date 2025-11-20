@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT to MarkDown plus",
-  "version": "6.1",
+  "version": "6.2",
   "description": "Export chat history from ChatGPT and Grok websites to normal format as Markdown, including multi-conversation export support.",
   "permissions": [
     "storage",
@@ -28,8 +28,7 @@
       "matches": [
         "https://*.openai.com/*",
         "https://chatgpt.com/*",
-        "https://grok.com/*",
-        "https://gemini.google.com/*"
+        "https://grok.com/*"
       ],
       "js": [
         "jszip.min.js",

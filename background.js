@@ -77,11 +77,11 @@ async function processNextConversation() {
         // Navigate to conversation
         await chrome.tabs.update(tabId, { url: conversation.url });
 
-        // Wait for page load (with 10 second additional wait)
+        // Wait for page load with user-configured delay
         await waitForTabLoad(tabId);
 
         // Send message to content script to export
-        // Note: Data is stored in content script's memory, not returned here
+        // Note: Data is stored in IndexedDB, not returned here
         const response = await chrome.tabs.sendMessage(tabId, {
             action: "exportCurrentConversation",
             conversationInfo: conversation
@@ -105,8 +105,12 @@ async function processNextConversation() {
     exportState.currentIndex++;
     await chrome.storage.local.set({ exportState });
 
-    // Process next (with 3 second delay to avoid rate limiting)
-    setTimeout(() => processNextConversation(), 3000);
+    // Get user-configured delay between conversations
+    const settings = await chrome.storage.sync.get(['conversationDelay']);
+    const delay = (settings.conversationDelay !== undefined ? settings.conversationDelay : 0.5) * 1000;
+
+    console.log(`Waiting ${delay}ms before next conversation...`);
+    setTimeout(() => processNextConversation(), delay);
 }
 
 /**
@@ -114,17 +118,20 @@ async function processNextConversation() {
  * @param {number} tabId - Tab ID to monitor
  * @returns {Promise} Resolves when tab is fully loaded
  */
-function waitForTabLoad(tabId) {
+async function waitForTabLoad(tabId) {
+    // Get user-configured page load wait time
+    const settings = await chrome.storage.sync.get(['pageLoadWait']);
+    const waitTime = (settings.pageLoadWait !== undefined ? settings.pageLoadWait : 2) * 1000;
+
     return new Promise((resolve) => {
         const listener = (updatedTabId, changeInfo) => {
             if (updatedTabId === tabId && changeInfo.status === 'complete') {
                 chrome.tabs.onUpdated.removeListener(listener);
-                // Additional 10 second wait for dynamic content to fully load
-                console.log("Page loaded, waiting 10 seconds for dynamic content...");
+                console.log(`Page loaded, waiting ${waitTime / 1000} seconds for dynamic content...`);
                 setTimeout(() => {
                     console.log("Dynamic content wait complete");
                     resolve();
-                }, 10000);
+                }, waitTime);
             }
         };
 
