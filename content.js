@@ -26,6 +26,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === "getButtonStatus") {
         sendResponse({show: shouldShowExportButton});
     }
+
+    // NEW: Get conversation list
+    if (request.action === "getConversationList") {
+        const conversations = getConversationList();
+        sendResponse({ success: true, conversations: conversations });
+    }
+
+    // NEW: Export current conversation (for multi-export)
+    if (request.action === "exportCurrentConversation") {
+        exportCurrentConversationData(request.conversationInfo)
+            .then(result => sendResponse(result))
+            .catch(error => sendResponse({ success: false, error: error.message }));
+        return true; // Async response
+    }
+
+    // NEW: Create multi-conversation ZIP
+    if (request.action === "createMultiConversationZip") {
+        createMultiConversationZip(request.exportedData, request.errors);
+        sendResponse({ success: true });
+    }
+
     return true; // 保持消息通道开放，以便异步响应
 });
 
@@ -667,4 +688,284 @@ async function createZipFile(markdownContent, downloadedImages) {
 
     console.log('✓ ZIP文件创建完成');
     return zipBlob;
+}
+
+/**
+ * Sanitize filename to remove invalid characters
+ * @param {string} filename - Original filename
+ * @returns {string} Sanitized filename
+ */
+function sanitizeFilename(filename) {
+    return filename
+        .replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
+        .replace(/\s+/g, '_')
+        .substring(0, 100); // Limit length
+}
+
+/**
+ * Get all conversation links from ChatGPT sidebar
+ * @returns {Array} Array of {title, url, id} objects
+ */
+function getConversationList() {
+    const currentUrl = window.location.href;
+    const conversations = [];
+
+    if (currentUrl.includes("openai.com") || currentUrl.includes("chatgpt.com")) {
+        // Strategy 1: Find all links that match conversation URL pattern
+        const links = document.querySelectorAll('a[href*="/c/"]');
+
+        links.forEach(link => {
+            const href = link.href;
+            const match = href.match(/\/c\/([a-zA-Z0-9-]+)/);
+
+            if (match) {
+                const id = match[1];
+                // Get title from link text or aria-label
+                const title = link.textContent.trim() ||
+                              link.getAttribute('aria-label') ||
+                              `Conversation ${id.substring(0, 8)}`;
+
+                conversations.push({
+                    id: id,
+                    url: href,
+                    title: sanitizeFilename(title)
+                });
+            }
+        });
+
+        // Strategy 2: Try alternative selectors if no results
+        if (conversations.length === 0) {
+            console.log("Strategy 1 failed, trying alternative selectors...");
+            const navItems = document.querySelectorAll('nav li a, aside li a');
+            navItems.forEach(link => {
+                const href = link.href;
+                const match = href.match(/\/c\/([a-zA-Z0-9-]+)/);
+
+                if (match) {
+                    const id = match[1];
+                    const title = link.textContent.trim() ||
+                                  link.getAttribute('aria-label') ||
+                                  `Conversation ${id.substring(0, 8)}`;
+
+                    conversations.push({
+                        id: id,
+                        url: href,
+                        title: sanitizeFilename(title)
+                    });
+                }
+            });
+        }
+
+        // Strategy 3: Fallback - any links with conversation pattern
+        if (conversations.length === 0) {
+            console.log("Strategy 2 failed, trying fallback...");
+            const allLinks = document.querySelectorAll('a');
+            allLinks.forEach(link => {
+                const href = link.href;
+                if (/\/c\/[a-zA-Z0-9-]+/.test(href)) {
+                    const match = href.match(/\/c\/([a-zA-Z0-9-]+)/);
+                    if (match) {
+                        const id = match[1];
+                        const title = link.textContent.trim() ||
+                                      link.getAttribute('aria-label') ||
+                                      `Conversation ${id.substring(0, 8)}`;
+
+                        conversations.push({
+                            id: id,
+                            url: href,
+                            title: sanitizeFilename(title)
+                        });
+                    }
+                }
+            });
+        }
+    }
+
+    // Remove duplicates based on ID
+    const uniqueConversations = Array.from(
+        new Map(conversations.map(c => [c.id, c])).values()
+    );
+
+    console.log(`Found ${uniqueConversations.length} conversations`);
+    return uniqueConversations;
+}
+
+/**
+ * Check if current page is a conversation page
+ * @returns {boolean} True if on conversation page
+ */
+function isConversationPage() {
+    const url = window.location.href;
+    return url.match(/\/c\/[a-zA-Z0-9-]+/) !== null;
+}
+
+/**
+ * Get current conversation ID
+ * @returns {string|null} Conversation ID or null
+ */
+function getCurrentConversationId() {
+    const match = window.location.href.match(/\/c\/([a-zA-Z0-9-]+)/);
+    return match ? match[1] : null;
+}
+
+/**
+ * Export current conversation and return data (for multi-export)
+ * Does not download, just returns the data
+ * @param {Object} conversationInfo - Conversation metadata {id, title, url}
+ * @returns {Promise<Object>} Export result with success status and data
+ */
+async function exportCurrentConversationData(conversationInfo) {
+    console.log(`Exporting conversation: ${conversationInfo.title}`);
+
+    try {
+        let markdownContent = "";
+        let allImages = [];
+        let allElements = getConversationElements();
+
+        console.log(`Found ${allElements.length} conversation elements`);
+
+        if (allElements.length === 0) {
+            throw new Error("No conversation elements found");
+        }
+
+        // Process conversation elements (same as exportChatAsZip)
+        for (let i = 0; i < allElements.length; i += 2) {
+            if (!allElements[i + 1]) break;
+
+            let userHtml = allElements[i].innerHTML.trim();
+            let answerHtml = allElements[i + 1].innerHTML.trim();
+
+            const userResult = htmlToMarkdown(userHtml, true);
+            let userMarkdown;
+            if (typeof userResult === 'object') {
+                userMarkdown = userResult.markdown;
+                allImages = allImages.concat(userResult.images);
+            } else {
+                userMarkdown = userResult;
+            }
+
+            const answerResult = htmlToMarkdown(answerHtml, true);
+            let answerMarkdown;
+            if (typeof answerResult === 'object') {
+                answerMarkdown = answerResult.markdown;
+                allImages = allImages.concat(answerResult.images);
+            } else {
+                answerMarkdown = answerResult;
+            }
+
+            markdownContent += `\n# 用户问题\n${userMarkdown}\n# 回答\n${answerMarkdown}`;
+        }
+
+        // Re-number images
+        const imagePositions = allImages.map(img => ({
+            image: img,
+            firstPosition: markdownContent.indexOf(img.localPath)
+        }));
+
+        imagePositions.sort((a, b) => a.firstPosition - b.firstPosition);
+
+        imagePositions.forEach((item, index) => {
+            const img = item.image;
+            const extension = img.extension || img.filename.split('.').pop();
+            const newFilename = `image_${String(index + 1).padStart(3, '0')}.${extension}`;
+            const newLocalPath = `./images/${newFilename}`;
+
+            markdownContent = markdownContent.replace(new RegExp(img.localPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), newLocalPath);
+
+            img.filename = newFilename;
+            img.localPath = newLocalPath;
+        });
+
+        markdownContent = markdownContent.replace(/&amp;/g, '&');
+
+        // Download images
+        console.log(`Downloading ${allImages.length} images...`);
+        const downloadedImages = await downloadImages(allImages);
+        console.log(`Downloaded ${downloadedImages.length} images successfully`);
+
+        return {
+            success: true,
+            data: {
+                markdown: markdownContent,
+                images: downloadedImages,
+                conversationInfo: conversationInfo
+            }
+        };
+
+    } catch (error) {
+        console.error('Export failed:', error);
+        return {
+            success: false,
+            error: error.message
+        };
+    }
+}
+
+/**
+ * Create multi-conversation ZIP file
+ * @param {Array} exportedData - Array of exported conversation data
+ * @param {Array} errors - Array of error objects
+ */
+async function createMultiConversationZip(exportedData, errors) {
+    console.log(`Creating multi-conversation ZIP with ${exportedData.length} conversations`);
+
+    try {
+        const zip = new JSZip();
+
+        // Add README
+        let readmeContent = `# Multi-Conversation Export\n\n`;
+        readmeContent += `Export Date: ${new Date().toLocaleString()}\n`;
+        readmeContent += `Total Conversations: ${exportedData.length}\n`;
+
+        if (errors.length > 0) {
+            readmeContent += `\n## Errors (${errors.length})\n`;
+            errors.forEach((err, idx) => {
+                readmeContent += `${idx + 1}. ${err.conversation.title}: ${err.error}\n`;
+            });
+        }
+
+        readmeContent += `\n## Conversations\n`;
+        exportedData.forEach((item, idx) => {
+            readmeContent += `${idx + 1}. ${item.conversation.title}\n`;
+        });
+
+        zip.file('README.txt', readmeContent);
+
+        // Add each conversation
+        for (let i = 0; i < exportedData.length; i++) {
+            const item = exportedData[i];
+            const folderName = `conversation_${String(i + 1).padStart(3, '0')}_${item.conversation.title}`;
+            const conversationFolder = zip.folder(folderName);
+
+            // Add markdown file
+            conversationFolder.file('conversation.md', item.data.markdown);
+
+            // Add images if any
+            if (item.data.images.length > 0) {
+                const imagesFolder = conversationFolder.folder('images');
+
+                for (const image of item.data.images) {
+                    imagesFolder.file(image.filename, image.blob);
+                }
+            }
+        }
+
+        // Generate ZIP
+        const zipBlob = await zip.generateAsync({
+            type: 'blob',
+            compression: 'DEFLATE',
+            compressionOptions: { level: 6 }
+        });
+
+        // Download
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+        download(zipBlob, `multi-chat-export_${timestamp}.zip`, 'application/zip');
+
+        console.log('Multi-conversation export complete!');
+        alert(`Successfully exported ${exportedData.length} conversations!${errors.length > 0 ? ` (${errors.length} errors)` : ''}`);
+
+    } catch (error) {
+        console.error('Failed to create multi-conversation ZIP:', error);
+        alert('Failed to create ZIP file. See console for details.');
+    }
 }

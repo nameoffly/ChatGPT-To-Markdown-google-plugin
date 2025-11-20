@@ -1,20 +1,224 @@
 /**
  * @Author Ye bv
  * @Time 2024/2/8 15:02
- * @Description
+ * @Description Multi-conversation export orchestrator
  */
-// 当插件安装或更新时触发
-chrome.runtime.onInstalled.addListener(function() {
-    console.log("ChatGPT Exporter 插件已安装或更新");
+
+// State management for multi-conversation export
+let exportState = {
+    isExporting: false,
+    conversations: [],
+    currentIndex: 0,
+    exportedData: [],
+    errors: []
+};
+
+/**
+ * Start multi-conversation export process
+ * @param {Array} conversations - Array of conversation objects {id, url, title}
+ */
+async function startMultiConversationExport(conversations) {
+    if (exportState.isExporting) {
+        console.log("Export already in progress");
+        return { error: "Export already in progress" };
+    }
+
+    exportState = {
+        isExporting: true,
+        conversations: conversations,
+        currentIndex: 0,
+        exportedData: [],
+        errors: []
+    };
+
+    // Store state in chrome.storage for recovery
+    await chrome.storage.local.set({ exportState });
+
+    console.log(`Starting multi-conversation export: ${conversations.length} conversations`);
+
+    // Start processing
+    processNextConversation();
+
+    return { success: true, total: conversations.length };
+}
+
+/**
+ * Process next conversation in queue
+ */
+async function processNextConversation() {
+    const { conversations, currentIndex } = exportState;
+
+    if (currentIndex >= conversations.length) {
+        // All conversations processed
+        console.log("All conversations processed. Creating combined ZIP...");
+        await finishMultiExport();
+        return;
+    }
+
+    const conversation = conversations[currentIndex];
+    console.log(`Processing ${currentIndex + 1}/${conversations.length}: ${conversation.title}`);
+
+    try {
+        // Get the active tab
+        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        const tabId = tabs[0].id;
+
+        // Navigate to conversation
+        await chrome.tabs.update(tabId, { url: conversation.url });
+
+        // Wait for page load (with 10 second additional wait)
+        await waitForTabLoad(tabId);
+
+        // Send message to content script to export
+        const response = await chrome.tabs.sendMessage(tabId, {
+            action: "exportCurrentConversation",
+            conversationInfo: conversation
+        });
+
+        if (response && response.success) {
+            exportState.exportedData.push({
+                conversation: conversation,
+                data: response.data
+            });
+            console.log(`Successfully exported: ${conversation.title}`);
+        } else {
+            const errorMsg = response ? response.error : "No response from content script";
+            exportState.errors.push({
+                conversation: conversation,
+                error: errorMsg
+            });
+            console.error(`Failed to export ${conversation.title}: ${errorMsg}`);
+        }
+
+    } catch (error) {
+        console.error(`Error processing conversation ${conversation.title}:`, error);
+        exportState.errors.push({
+            conversation: conversation,
+            error: error.message
+        });
+    }
+
+    // Move to next conversation
+    exportState.currentIndex++;
+    await chrome.storage.local.set({ exportState });
+
+    // Process next (with 3 second delay to avoid rate limiting)
+    setTimeout(() => processNextConversation(), 3000);
+}
+
+/**
+ * Wait for tab to fully load
+ * @param {number} tabId - Tab ID to monitor
+ * @returns {Promise} Resolves when tab is fully loaded
+ */
+function waitForTabLoad(tabId) {
+    return new Promise((resolve) => {
+        const listener = (updatedTabId, changeInfo) => {
+            if (updatedTabId === tabId && changeInfo.status === 'complete') {
+                chrome.tabs.onUpdated.removeListener(listener);
+                // Additional 10 second wait for dynamic content to fully load
+                console.log("Page loaded, waiting 10 seconds for dynamic content...");
+                setTimeout(() => {
+                    console.log("Dynamic content wait complete");
+                    resolve();
+                }, 10000);
+            }
+        };
+
+        chrome.tabs.onUpdated.addListener(listener);
+
+        // Timeout after 60 seconds
+        setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(listener);
+            console.warn("Page load timeout (60s)");
+            resolve();
+        }, 60000);
+    });
+}
+
+/**
+ * Finish multi-export and create combined ZIP
+ */
+async function finishMultiExport() {
+    console.log(`Export complete. Successfully exported: ${exportState.exportedData.length}, Errors: ${exportState.errors.length}`);
+
+    // Get the active tab
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tabId = tabs[0].id;
+
+    // Send message to content script to create final ZIP
+    await chrome.tabs.sendMessage(tabId, {
+        action: "createMultiConversationZip",
+        exportedData: exportState.exportedData,
+        errors: exportState.errors
+    });
+
+    // Reset state
+    exportState.isExporting = false;
+    await chrome.storage.local.remove('exportState');
+}
+
+/**
+ * Get export progress
+ * @returns {Object} Progress information
+ */
+async function getExportProgress() {
+    return {
+        isExporting: exportState.isExporting,
+        total: exportState.conversations.length,
+        current: exportState.currentIndex,
+        errors: exportState.errors.length
+    };
+}
+
+/**
+ * Cancel ongoing export
+ */
+async function cancelExport() {
+    console.log("Export cancelled by user");
+    exportState.isExporting = false;
+    await chrome.storage.local.remove('exportState');
+    return { success: true };
+}
+
+// Message listeners
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message.action === "startMultiExport") {
+        startMultiConversationExport(message.conversations)
+            .then(result => sendResponse(result))
+            .catch(error => sendResponse({ error: error.message }));
+        return true; // Async response
+    }
+
+    if (message.action === "getExportProgress") {
+        getExportProgress()
+            .then(progress => sendResponse(progress))
+            .catch(error => sendResponse({ error: error.message }));
+        return true;
+    }
+
+    if (message.action === "cancelExport") {
+        cancelExport()
+            .then(result => sendResponse(result))
+            .catch(error => sendResponse({ error: error.message }));
+        return true;
+    }
+
+    // Legacy message handler for single export
+    if (message.action === "exportChatHistory") {
+        console.log("接收到导出聊天记录的请求");
+    }
 });
 
-// 监听来自内容脚本的消息
-chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
-    if (message.action === "exportChatHistory") {
-        // 在这里添加导出聊天记录的逻辑
-        console.log("接收到导出聊天记录的请求");
+// Installation listener
+chrome.runtime.onInstalled.addListener(() => {
+    console.log("ChatGPT Exporter (Multi-Conversation v6.0) 插件已安装或更新");
 
-        // 这里可以向内容脚本发送消息，执行相应的操作
-        // 例如：sendResponse({ success: true });
-    }
+    // Check for interrupted export and clear it
+    chrome.storage.local.get('exportState', (result) => {
+        if (result.exportState && result.exportState.isExporting) {
+            console.log("Found interrupted export. Clearing...");
+            chrome.storage.local.remove('exportState');
+        }
+    });
 });
