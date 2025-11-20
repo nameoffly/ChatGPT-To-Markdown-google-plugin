@@ -16,6 +16,75 @@ let multiExportData = {
     errors: []
 };
 let isChatGPT = false;
+
+// IndexedDB helper functions for storing large data (avoids chrome.storage quota limits)
+const DB_NAME = 'ChatExportDB';
+const DB_VERSION = 1;
+const STORE_NAME = 'conversations';
+
+function openDB() {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => resolve(request.result);
+
+        request.onupgradeneeded = (event) => {
+            const db = event.target.result;
+            if (!db.objectStoreNames.contains(STORE_NAME)) {
+                db.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
+            }
+        };
+    });
+}
+
+async function saveConversationToDB(conversationData) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction([STORE_NAME], 'readwrite');
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.add(conversationData);
+
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function saveErrorToDB(errorData) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction([STORE_NAME], 'readwrite');
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.add({ type: 'error', ...errorData });
+
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function getAllFromDB() {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction([STORE_NAME], 'readonly');
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.getAll();
+
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function clearDB() {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction([STORE_NAME], 'readwrite');
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.clear();
+
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+    });
+}
 // 监听来自 popup.js 的消息，实现按下按钮后导出或复制聊天记录
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === "exportChatAsMarkdown") {
@@ -44,115 +113,122 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === "exportCurrentConversation") {
         exportCurrentConversationData(request.conversationInfo)
             .then(async result => {
-                if (result.success) {
-                    // Convert Blobs to ArrayBuffers for storage
-                    const images = result.data.images || [];
-                    const serializedImages = [];
+                try {
+                    if (result.success) {
+                        console.log(`[Export] Processing result for: ${request.conversationInfo.title}`);
 
-                    for (const img of images) {
-                        if (img.blob) {
-                            const arrayBuffer = await img.blob.arrayBuffer();
-                            serializedImages.push({
-                                filename: img.filename,
-                                arrayBuffer: Array.from(new Uint8Array(arrayBuffer)),
-                                type: img.blob.type,
-                                localPath: img.localPath
-                            });
-                        }
+                        // Store Blobs directly in IndexedDB (no need to convert to ArrayBuffer)
+                        // IndexedDB supports Blob objects natively
+                        const exportItem = {
+                            type: 'conversation',
+                            conversation: request.conversationInfo,
+                            data: {
+                                markdown: result.data.markdown,
+                                images: result.data.images  // Store Blobs directly
+                            }
+                        };
+
+                        // Save to IndexedDB instead of chrome.storage
+                        await saveConversationToDB(exportItem);
+
+                        console.log(`[Export] ✓ Saved conversation "${request.conversationInfo.title}" to IndexedDB`);
+                        sendResponse({ success: true });
+                    } else {
+                        console.error(`[Export] ✗ Export failed for "${request.conversationInfo.title}": ${result.error}`);
+
+                        // Save error to IndexedDB
+                        await saveErrorToDB({
+                            conversation: request.conversationInfo,
+                            error: result.error
+                        });
+
+                        sendResponse({ success: false, error: result.error });
+                    }
+                } catch (processingError) {
+                    console.error(`[Export] ✗ Error processing export for "${request.conversationInfo.title}":`, processingError);
+
+                    // Save error to IndexedDB
+                    try {
+                        await saveErrorToDB({
+                            conversation: request.conversationInfo,
+                            error: processingError.message
+                        });
+                    } catch (dbError) {
+                        console.error('[Export] Failed to save error to DB:', dbError);
                     }
 
-                    const exportItem = {
-                        conversation: request.conversationInfo,
-                        data: {
-                            markdown: result.data.markdown,
-                            images: serializedImages
-                        }
-                    };
-
-                    // Load existing data from storage
-                    const storage = await chrome.storage.local.get('multiExportData');
-                    const existingData = storage.multiExportData || { exportedConversations: [], errors: [] };
-
-                    existingData.exportedConversations.push(exportItem);
-
-                    // Save to chrome.storage
-                    await chrome.storage.local.set({ multiExportData: existingData });
-
-                    console.log(`Saved conversation ${request.conversationInfo.title} to storage. Total: ${existingData.exportedConversations.length}`);
-                    sendResponse({ success: true });
-                } else {
-                    // Load existing data
-                    const storage = await chrome.storage.local.get('multiExportData');
-                    const existingData = storage.multiExportData || { exportedConversations: [], errors: [] };
-
-                    existingData.errors.push({
-                        conversation: request.conversationInfo,
-                        error: result.error
-                    });
-
-                    await chrome.storage.local.set({ multiExportData: existingData });
-                    sendResponse({ success: false, error: result.error });
+                    sendResponse({ success: false, error: processingError.message });
                 }
             })
             .catch(async error => {
-                const storage = await chrome.storage.local.get('multiExportData');
-                const existingData = storage.multiExportData || { exportedConversations: [], errors: [] };
+                console.error(`[Export] ✗ Catch block - Error exporting "${request.conversationInfo.title}":`, error);
 
-                existingData.errors.push({
-                    conversation: request.conversationInfo,
-                    error: error.message
-                });
+                // Save error to IndexedDB
+                try {
+                    await saveErrorToDB({
+                        conversation: request.conversationInfo,
+                        error: error.message || String(error)
+                    });
+                } catch (dbError) {
+                    console.error('[Export] Failed to save error to DB:', dbError);
+                }
 
-                await chrome.storage.local.set({ multiExportData: existingData });
-                sendResponse({ success: false, error: error.message });
+                sendResponse({ success: false, error: error.message || String(error) });
             });
         return true; // Async response
     }
 
     // NEW: Create multi-conversation ZIP
     if (request.action === "createMultiConversationZip") {
-        // Read from chrome.storage and convert ArrayBuffers back to Blobs
-        chrome.storage.local.get('multiExportData', async (storage) => {
-            const data = storage.multiExportData || { exportedConversations: [], errors: [] };
+        // Read from IndexedDB
+        getAllFromDB()
+            .then(async allData => {
+                console.log(`[ZIP] Retrieved ${allData.length} items from IndexedDB`);
 
-            console.log(`Creating ZIP with ${data.exportedConversations.length} conversations from storage`);
+                // Separate conversations and errors
+                const exportedData = allData
+                    .filter(item => item.type === 'conversation')
+                    .map(item => ({
+                        conversation: item.conversation,
+                        data: item.data  // Blobs are already in the correct format
+                    }));
 
-            // Convert ArrayBuffers back to Blobs
-            const exportedData = data.exportedConversations.map(item => {
-                const images = item.data.images.map(img => {
-                    const uint8Array = new Uint8Array(img.arrayBuffer);
-                    const blob = new Blob([uint8Array], { type: img.type });
-                    return {
-                        filename: img.filename,
-                        blob: blob,
-                        localPath: img.localPath
-                    };
-                });
+                const errors = allData
+                    .filter(item => item.type === 'error')
+                    .map(item => ({
+                        conversation: item.conversation,
+                        error: item.error
+                    }));
 
-                return {
-                    conversation: item.conversation,
-                    data: {
-                        markdown: item.data.markdown,
-                        images: images
-                    }
-                };
+                console.log(`[ZIP] Creating ZIP with ${exportedData.length} conversations and ${errors.length} errors`);
+
+                await createMultiConversationZip(exportedData, errors);
+
+                // Clear IndexedDB after creating ZIP
+                await clearDB();
+                console.log('[ZIP] Cleared IndexedDB');
+
+                sendResponse({ success: true });
+            })
+            .catch(error => {
+                console.error('[ZIP] Error reading from IndexedDB:', error);
+                alert(`Failed to create ZIP: ${error.message}`);
+                sendResponse({ success: false, error: error.message });
             });
-
-            await createMultiConversationZip(exportedData, data.errors);
-
-            // Clear storage after creating ZIP
-            await chrome.storage.local.remove('multiExportData');
-            sendResponse({ success: true });
-        });
         return true; // Async response
     }
 
     // NEW: Reset multi-export data (when starting new export)
     if (request.action === "resetMultiExportData") {
-        chrome.storage.local.remove('multiExportData', () => {
-            console.log('Cleared multi-export data from storage');
-            sendResponse({ success: true });
-        });
+        clearDB()
+            .then(() => {
+                console.log('[Reset] Cleared IndexedDB');
+                sendResponse({ success: true });
+            })
+            .catch(error => {
+                console.error('[Reset] Error clearing IndexedDB:', error);
+                sendResponse({ success: false, error: error.message });
+            });
         return true; // Async response
     }
 
@@ -1184,7 +1260,16 @@ async function createMultiConversationZip(exportedData, errors) {
         download(zipBlob, filename, 'application/zip');
 
         console.log('Multi-conversation export complete!');
-        alert(`Successfully exported ${exportedData.length} conversations!${errors.length > 0 ? ` (${errors.length} errors)` : ''}`);
+
+        let alertMessage = `Successfully exported ${exportedData.length} conversations!`;
+        if (errors.length > 0) {
+            alertMessage += `\n\n⚠️ ${errors.length} errors occurred:\n`;
+            errors.forEach((err, idx) => {
+                alertMessage += `${idx + 1}. ${err.conversation.title}\n   Error: ${err.error}\n`;
+            });
+            alertMessage += `\nCheck the README.txt in the ZIP file for details.`;
+        }
+        alert(alertMessage);
 
     } catch (error) {
         console.error('Failed to create multi-conversation ZIP:', error);
